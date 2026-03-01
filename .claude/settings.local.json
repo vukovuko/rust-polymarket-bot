@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rustc:*)",
+      "Bash(dpkg:*)",
+      "Bash(curl:*)",
+      "Bash(test:*)",
+      "WebSearch",
+      "Bash(pkg-config:*)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo add:*)",
+      "Bash(cargo build:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}
