@@ -3,20 +3,23 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer};
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
-use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
+use polymarket_client_sdk::auth::{LocalSigner, Normal, Signer};
+use polymarket_client_sdk::clob::types::{OrderType, Side};
 use polymarket_client_sdk::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk::types::{Decimal, U256};
 
-use super::types::{BotMarket, SimpleBook};
+use super::types::BotMarket;
+
+pub struct OrderResult {
+    pub order_id: String,
+    pub success: bool,
+    pub error_msg: Option<String>,
+}
 
 pub struct PolyClient {
     clob: Client<Authenticated<Normal>>,
-    // Store private key string for Phase 2 (re-create signer when needed for order signing)
-    #[allow(dead_code)]
-    private_key: String,
+    signer: LocalSigner<k256::ecdsa::SigningKey>,
 }
 
 impl PolyClient {
@@ -25,7 +28,10 @@ impl PolyClient {
             .context("Failed to parse private key")?
             .with_chain_id(Some(POLYGON));
 
-        tracing::info!("Authenticating with Polymarket (address: {:?})...", signer.address());
+        tracing::info!(
+            "Authenticating with Polymarket (address: {:?})...",
+            signer.address()
+        );
 
         let clob = Client::new(api_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
@@ -36,10 +42,7 @@ impl PolyClient {
 
         tracing::info!("Authenticated with Polymarket successfully");
 
-        Ok(PolyClient {
-            clob,
-            private_key: private_key.to_string(),
-        })
+        Ok(PolyClient { clob, signer })
     }
 
     pub async fn fetch_all_active_markets(&self) -> Result<Vec<BotMarket>> {
@@ -66,28 +69,94 @@ impl PolyClient {
         Ok(markets)
     }
 
-    pub async fn get_order_book(&self, token_id: U256) -> Result<SimpleBook> {
-        let request = OrderBookSummaryRequest::builder()
-            .token_id(token_id)
-            .build();
-
-        let book: OrderBookSummaryResponse = self.clob.order_book(&request).await
-            .context("Failed to fetch order book")?;
-
-        Ok(SimpleBook::from_order_book(&book))
-    }
-
+    #[allow(dead_code)]
     pub async fn get_fee_rate(&self, token_id: U256) -> Result<u32> {
-        let resp = self.clob.fee_rate_bps(token_id).await
+        let resp = self
+            .clob
+            .fee_rate_bps(token_id)
+            .await
             .context("Failed to fetch fee rate")?;
         Ok(resp.base_fee)
     }
 
+    #[allow(dead_code)]
     pub async fn get_midpoint(&self, token_id: U256) -> Result<Decimal> {
         use polymarket_client_sdk::clob::types::request::MidpointRequest;
         let request = MidpointRequest::builder().token_id(token_id).build();
-        let resp = self.clob.midpoint(&request).await
+        let resp = self
+            .clob
+            .midpoint(&request)
+            .await
             .context("Failed to fetch midpoint")?;
         Ok(resp.mid)
+    }
+
+    /// Place a maker-only limit buy order.
+    pub async fn place_limit_buy(
+        &self,
+        token_id: U256,
+        price: Decimal,
+        size: Decimal,
+    ) -> Result<OrderResult> {
+        let signable = self
+            .clob
+            .limit_order()
+            .token_id(token_id)
+            .side(Side::Buy)
+            .price(price)
+            .size(size)
+            .order_type(OrderType::GTC)
+            .post_only(true)
+            .build()
+            .await
+            .context("Failed to build limit order")?;
+
+        let signed = self
+            .clob
+            .sign(&self.signer, signable)
+            .await
+            .context("Failed to sign order")?;
+
+        let resp = self
+            .clob
+            .post_order(signed)
+            .await
+            .context("Failed to post order")?;
+
+        Ok(OrderResult {
+            order_id: resp.order_id,
+            success: resp.success,
+            error_msg: resp.error_msg,
+        })
+    }
+
+    /// Cancel a single order by ID.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let resp = self
+            .clob
+            .cancel_order(order_id)
+            .await
+            .context("Failed to cancel order")?;
+
+        if !resp.not_canceled.is_empty() {
+            tracing::warn!("Failed to cancel some orders: {:?}", resp.not_canceled);
+        }
+        Ok(())
+    }
+
+    /// Cancel all orders (kill switch).
+    pub async fn cancel_all(&self) -> Result<()> {
+        let resp = self
+            .clob
+            .cancel_all_orders()
+            .await
+            .context("Failed to cancel all orders")?;
+
+        tracing::info!(
+            "Cancelled {} orders, {} failed",
+            resp.canceled.len(),
+            resp.not_canceled.len(),
+        );
+        Ok(())
     }
 }

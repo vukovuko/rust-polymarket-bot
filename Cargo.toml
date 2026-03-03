@@ -3,10 +3,16 @@ name = "polymarket-bot"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "check-edges"
+path = "src/bin/check_edges.rs"
+
 [dependencies]
 anyhow = "1.0.102"
+chrono = "0.4.44"
 dotenvy = "0.15.7"
 futures-util = "0.3.32"
+k256 = "0.13"
 polymarket-client-sdk = { version = "0.4.3", features = ["clob", "gamma", "ws", "tracing"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }

@@ -2343,6 +2343,7 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -2737,8 +2738,10 @@ name = "polymarket-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dotenvy",
  "futures-util",
+ "k256",
  "polymarket-client-sdk",
  "reqwest 0.13.2",
  "serde",

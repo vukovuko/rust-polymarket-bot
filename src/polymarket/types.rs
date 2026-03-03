@@ -1,7 +1,9 @@
-use polymarket_client_sdk::clob::types::response::{MarketResponse, OrderBookSummaryResponse};
+use chrono::NaiveDate;
+use polymarket_client_sdk::clob::types::response::MarketResponse;
 use polymarket_client_sdk::types::{DateTime, Decimal, U256, Utc};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BotMarket {
     pub condition_id: String,
     pub question: String,
@@ -26,8 +28,10 @@ impl BotMarket {
 
         let condition_id = m.condition_id.map(|c| format!("{c:?}"))?;
 
-        // Determine which token is YES and which is NO
-        let (yes_idx, no_idx) = if m.tokens[0].outcome.to_lowercase() == "yes" {
+        // Determine which token is the "positive" side (Yes/Up) and "negative" (No/Down).
+        // Polymarket uses "Yes"/"No" for most markets, but "Up"/"Down" for BTC 5-min markets.
+        let first = m.tokens[0].outcome.to_lowercase();
+        let (yes_idx, no_idx) = if first == "yes" || first == "up" {
             (0, 1)
         } else {
             (1, 0)
@@ -51,41 +55,35 @@ impl BotMarket {
     }
 }
 
+/// A weather temperature bucket market with structured metadata.
+/// Each bucket is one binary market within a multi-outcome weather event.
 #[derive(Debug, Clone)]
-pub struct SimpleBook {
-    pub best_bid: Option<Decimal>,
-    pub best_ask: Option<Decimal>,
-    pub midpoint: Option<Decimal>,
+#[allow(dead_code)]
+pub struct WeatherMarket {
+    pub market: BotMarket,
+    pub city_slug: String,
+    pub city_name: String,
+    pub date: NaiveDate,
+    /// Lower temperature bound. f64::NEG_INFINITY for "X or below" buckets.
+    pub bucket_lower: f64,
+    /// Upper temperature bound. f64::INFINITY for "X or above" buckets.
+    pub bucket_upper: f64,
+    /// True if temperature is in Fahrenheit, false for Celsius.
+    pub fahrenheit: bool,
+    /// YES price from Gamma API at discovery time (may be stale).
+    pub gamma_yes_price: f64,
 }
 
-impl SimpleBook {
-    pub fn from_order_book(book: &OrderBookSummaryResponse) -> Self {
-        let best_bid = book.bids.iter().map(|o| o.price).max();
-        let best_ask = book.asks.iter().map(|o| o.price).min();
-        let midpoint = match (best_bid, best_ask) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
-            _ => None,
-        };
-
-        SimpleBook {
-            best_bid,
-            best_ask,
-            midpoint,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Up,
-    Down,
-}
-
-impl std::fmt::Display for Direction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Direction::Up => write!(f, "UP"),
-            Direction::Down => write!(f, "DOWN"),
+impl WeatherMarket {
+    /// Human-readable bucket label like "38-39°F" or "≤31°F".
+    pub fn bucket_label(&self) -> String {
+        let unit = if self.fahrenheit { "F" } else { "C" };
+        if self.bucket_lower == f64::NEG_INFINITY {
+            format!("≤{:.0}°{unit}", self.bucket_upper)
+        } else if self.bucket_upper == f64::INFINITY {
+            format!("≥{:.0}°{unit}", self.bucket_lower)
+        } else {
+            format!("{:.0}-{:.0}°{unit}", self.bucket_lower, self.bucket_upper)
         }
     }
 }

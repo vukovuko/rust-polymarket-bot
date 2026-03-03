@@ -1,34 +1,41 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio_tungstenite::connect_async;
 
 const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@trade";
 const MAX_BUFFER_AGE_MS: u64 = 10_000;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
+/// Broadcast on every trade: (price_change_5s, latest_price)
+pub type PriceSignal = (f64, f64);
+
 #[derive(Debug, Clone)]
-pub struct PriceTick {
-    pub price: f64,
-    pub timestamp_ms: u64,
+struct PriceTick {
+    price: f64,
+    timestamp_ms: u64,
 }
 
 #[derive(Clone)]
 pub struct BinanceFeed {
     prices: Arc<RwLock<VecDeque<PriceTick>>>,
     connected: Arc<AtomicBool>,
+    signal_tx: Arc<watch::Sender<Option<PriceSignal>>>,
 }
 
 impl BinanceFeed {
-    pub fn new() -> Self {
-        BinanceFeed {
+    pub fn new() -> (Self, watch::Receiver<Option<PriceSignal>>) {
+        let (tx, rx) = watch::channel(None);
+        let feed = BinanceFeed {
             prices: Arc::new(RwLock::new(VecDeque::with_capacity(512))),
             connected: Arc::new(AtomicBool::new(false)),
-        }
+            signal_tx: Arc::new(tx),
+        };
+        (feed, rx)
     }
 
     pub async fn run(&self) {
@@ -77,7 +84,6 @@ impl BinanceFeed {
     }
 
     async fn handle_message(&self, text: &str) {
-        // Binance trade message: {"e":"trade","E":...,"s":"BTCUSDT","t":...,"p":"97245.50","q":"0.001","T":1672515782136,"m":true,...}
         let parsed: serde_json::Value = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(_) => return,
@@ -106,28 +112,24 @@ impl BinanceFeed {
         while prices.front().is_some_and(|t| t.timestamp_ms < cutoff) {
             prices.pop_front();
         }
+
+        // Compute 5s change and broadcast immediately
+        if let Some(change) = Self::compute_change_5s(&prices) {
+            let _ = self.signal_tx.send(Some((change, price)));
+        }
     }
 
-    pub async fn latest_price(&self) -> Option<f64> {
-        self.prices.read().await.back().map(|t| t.price)
-    }
-
-    /// Returns the price change over the last 5 seconds as a fraction (e.g., 0.0015 = 0.15%).
-    pub async fn price_change_5s(&self) -> Option<f64> {
-        let prices = self.prices.read().await;
+    fn compute_change_5s(prices: &VecDeque<PriceTick>) -> Option<f64> {
         let newest = prices.back()?;
         let cutoff = newest.timestamp_ms.saturating_sub(5_000);
-
-        // Find the oldest tick within the 5s window
         let oldest = prices.iter().find(|t| t.timestamp_ms >= cutoff)?;
-
         if oldest.price == 0.0 {
             return None;
         }
-
         Some((newest.price - oldest.price) / oldest.price)
     }
 
+    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }

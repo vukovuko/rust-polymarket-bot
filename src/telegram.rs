@@ -13,8 +13,12 @@ impl TelegramSender {
         match (tg_bot_token, tg_chat_id) {
             (Some(token), Some(chat_id)) if !token.is_empty() && !chat_id.is_empty() => {
                 tracing::info!("Telegram alerts enabled");
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default();
                 TelegramSender {
-                    client: reqwest::Client::new(),
+                    client,
                     bot_token: token.to_string(),
                     chat_id: chat_id.to_string(),
                     enabled: true,
@@ -38,10 +42,7 @@ impl TelegramSender {
             return Ok(());
         }
 
-        let url = format!(
-            "https://api.telegram.org/bot{}/sendMessage",
-            self.bot_token
-        );
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
 
         let body = json!({
             "chat_id": self.chat_id,
