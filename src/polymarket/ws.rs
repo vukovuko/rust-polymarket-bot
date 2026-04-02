@@ -137,11 +137,14 @@ impl PolyWs {
         loop {
             // Get current markets from market_finder (fresh on each reconnect)
             let mut markets = self.market_finder.btc_5min_markets().await;
+            // Only subscribe tail-above weather tokens (bucket_upper == INFINITY)
+            // to reduce WS load. We only bet on these, so no need for prices on others.
             let weather_markets: Vec<_> = self
                 .market_finder
                 .weather_markets()
                 .await
                 .into_iter()
+                .filter(|wm| wm.bucket_upper == f64::INFINITY)
                 .map(|wm| wm.market)
                 .collect();
             let btc_count = markets.len();

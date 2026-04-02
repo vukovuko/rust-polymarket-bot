@@ -172,8 +172,12 @@ impl WeatherStrategy {
         self.subscribed_tokens.clear();
 
         let markets = self.market_finder.weather_markets().await;
-        let current_tokens: HashSet<U256> =
-            markets.iter().map(|wm| wm.market.yes_token_id).collect();
+        // Only subscribe tail-above tokens — we only bet on these
+        let current_tokens: HashSet<U256> = markets
+            .iter()
+            .filter(|wm| wm.bucket_upper == f64::INFINITY)
+            .map(|wm| wm.market.yes_token_id)
+            .collect();
 
         // Get current WsClient from watch channel (latest connection)
         let ws = self.ws_rx.borrow().clone();
@@ -571,8 +575,9 @@ impl WeatherStrategy {
                     // Place real order if not in alert-only mode
                     if !self.config.alert_only && kelly_bet > 0.0 && market_price > 0.01 {
                         let price_dec = f64_to_decimal(market_price);
-                        // Floor shares to 2 decimals to avoid rounding up past budget
-                        let size_dec = f64_to_decimal_floor(kelly_bet / market_price);
+                        // Use the rounded price for sizing so cost = price_dec * size_dec <= kelly_bet
+                        let rounded_price = decimal_to_f64(price_dec);
+                        let size_dec = f64_to_decimal_floor(kelly_bet / rounded_price);
                         let reason = format!(
                             "Weather: {} {} {} (f={:.0}% m={:.0}% edge=+{:.1}%)",
                             wm.city_name,

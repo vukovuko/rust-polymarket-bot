@@ -167,7 +167,9 @@
       "WebFetch(domain:researchgate.net)",
       "WebFetch(domain:www.researchgate.net)",
       "WebFetch(domain:users.rust-lang.org)",
-      "Bash(docker-compose logs:*)"
+      "Bash(docker-compose logs:*)",
+      "WebFetch(domain:api.polygonscan.com)",
+      "WebFetch(domain:polygonscan.com)"
     ]
   }
 }

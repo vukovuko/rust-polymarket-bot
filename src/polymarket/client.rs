@@ -36,6 +36,7 @@ impl PolyClient {
         let clob = Client::new(api_url, ClobConfig::default())
             .context("Failed to create CLOB client")?
             .authentication_builder(&signer)
+            .signature_type(polymarket_client_sdk::clob::types::SignatureType::Proxy)
             .authenticate()
             .await
             .context("Failed to authenticate with Polymarket")?;
