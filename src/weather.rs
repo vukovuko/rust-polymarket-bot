@@ -1,11 +1,24 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 
+/// Cache TTL: 4 hours. GFS runs every 6h, ECMWF every 6-12h.
+/// Between model runs the API returns identical data, so re-fetching is waste.
+const CACHE_TTL: Duration = Duration::from_secs(4 * 3600);
+
+struct CacheEntry {
+    fetched_at: Instant,
+    data: HashMap<NaiveDate, CityForecast>,
+}
+
 /// Fetches ensemble weather forecasts from Open-Meteo API.
 pub struct WeatherFetcher {
     client: reqwest::Client,
+    /// In-memory cache: key = city_slug, value = assembled multi-model forecast.
+    cache: Mutex<HashMap<String, CacheEntry>>,
 }
 
 /// Per-model ensemble data, kept separate for weighted Gaussian CDF.
@@ -63,29 +76,93 @@ impl CityForecast {
     }
 }
 
-/// Model configuration: (name, weight, bias_fahrenheit, bias_celsius).
+struct ModelConfig {
+    name: &'static str,
+    api_model: &'static str,
+    /// Key suffix in the combined multi-model API response.
+    response_suffix: &'static str,
+    max_members: u32,
+    weight: f64,
+    bias_f: f64,
+    bias_c: f64,
+}
+
+/// Model configuration for combined Open-Meteo ensemble API call.
 /// Bias is added to raw member temps to correct systematic errors.
 /// GFS runs ~2°F cold on daily highs (NCEP studies show 1.5-1.8°C cold bias).
 /// ECMWF runs ~1°F cold (seasonal: ~0 in winter, ~2-3°F in summer).
-const MODEL_CONFIGS: &[(&str, f64, f64, f64)] = &[
-    //  name     weight  bias_F  bias_C
-    ("GFS", 0.35, 2.0, 1.1),
-    ("ECMWF", 0.40, 1.0, 0.6),
-    ("ICON", 0.25, 0.0, 0.0),
+const MODEL_CONFIGS: &[ModelConfig] = &[
+    ModelConfig {
+        name: "GFS",
+        api_model: "gfs_seamless",
+        response_suffix: "ncep_gefs_seamless",
+        max_members: 30,
+        weight: 0.25,
+        bias_f: 2.0,
+        bias_c: 1.1,
+    },
+    ModelConfig {
+        name: "ECMWF",
+        api_model: "ecmwf_ifs025",
+        response_suffix: "ecmwf_ifs025_ensemble",
+        max_members: 51,
+        weight: 0.30,
+        bias_f: 1.0,
+        bias_c: 0.6,
+    },
+    ModelConfig {
+        name: "ICON",
+        api_model: "icon_seamless",
+        response_suffix: "icon_seamless_eps",
+        max_members: 40,
+        weight: 0.15,
+        bias_f: 0.0,
+        bias_c: 0.0,
+    },
+    // AI-enhanced models — share initial conditions with parent models,
+    // so lower weight to avoid double-counting correlated forecasts.
+    ModelConfig {
+        name: "AIFS",
+        api_model: "ecmwf_aifs025",
+        response_suffix: "ecmwf_aifs025_ensemble",
+        max_members: 51,
+        weight: 0.15,
+        bias_f: 0.0,
+        bias_c: 0.0,
+    },
+    ModelConfig {
+        name: "AIGEFS",
+        api_model: "ncep_aigefs025",
+        response_suffix: "ncep_aigefs025",
+        max_members: 31,
+        weight: 0.10,
+        bias_f: 0.0,
+        bias_c: 0.0,
+    },
+    // Fully independent model — Canadian Meteorological Centre.
+    ModelConfig {
+        name: "GEM",
+        api_model: "gem_global",
+        response_suffix: "gem_global_ensemble",
+        max_members: 21,
+        weight: 0.15,
+        bias_f: 0.0,
+        bias_c: 0.0,
+    },
 ];
 
 fn model_weight(name: &str) -> f64 {
     MODEL_CONFIGS
         .iter()
-        .find(|(n, _, _, _)| *n == name)
-        .map_or(0.33, |(_, w, _, _)| *w)
+        .find(|m| m.name == name)
+        .map_or(0.33, |m| m.weight)
 }
 
 fn model_bias(name: &str, fahrenheit: bool) -> f64 {
     MODEL_CONFIGS
         .iter()
-        .find(|(n, _, _, _)| *n == name)
-        .map_or(0.0, |(_, _, bf, bc)| if fahrenheit { *bf } else { *bc })
+        .find(|m| m.name == name)
+        .map_or(0.0, |m| if fahrenheit { m.bias_f } else { m.bias_c })
 }
 
 impl WeatherFetcher {
@@ -94,7 +171,15 @@ impl WeatherFetcher {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_default();
-        WeatherFetcher { client }
+        WeatherFetcher {
+            client,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// How many entries are currently cached.
+    pub fn cache_size(&self) -> usize {
+        self.cache.lock().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Fetch ensemble forecast for a city. Returns member temperatures for
@@ -197,29 +282,47 @@ impl WeatherFetcher {
         Ok(forecasts)
     }
 
-    /// Fetch a single model's ensemble forecast.
-    /// Returns date → member temperatures for that model.
-    async fn fetch_single_model(
+    /// Fetch ensemble forecasts from all models in a single API call.
+    /// Uses `&models=...` with all MODEL_CONFIGS — zero additional HTTP requests.
+    /// The combined response uses model-suffixed member keys.
+    pub async fn fetch_combined_models(
         &self,
-        model: &str,
-        max_members: u32,
         city_slug: &str,
         lat: f64,
         lon: f64,
         fahrenheit: bool,
         timezone: &str,
-    ) -> Result<HashMap<NaiveDate, Vec<f64>>> {
+    ) -> Result<HashMap<NaiveDate, CityForecast>> {
+        // Check cache first
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(entry) = cache.get(city_slug) {
+                if entry.fetched_at.elapsed() < CACHE_TTL {
+                    tracing::debug!(
+                        "Weather: cache hit for {city_slug} (age: {:.0}m)",
+                        entry.fetched_at.elapsed().as_secs_f64() / 60.0,
+                    );
+                    return Ok(entry.data.clone());
+                }
+            }
+        }
+
         let unit_param = if fahrenheit {
             "&temperature_unit=fahrenheit"
         } else {
             ""
         };
 
+        let models_param = MODEL_CONFIGS
+            .iter()
+            .map(|m| m.api_model)
+            .collect::<Vec<_>>()
+            .join(",");
+
         let url = format!(
             "https://ensemble-api.open-meteo.com/v1/ensemble\
              ?latitude={lat}&longitude={lon}\
              &daily=temperature_2m_max\
-             &models={model}\
+             &models={models_param}\
              &forecast_days=7\
              &timezone={timezone}\
              {unit_param}",
@@ -236,7 +339,7 @@ impl WeatherFetcher {
             let status = http_resp.status();
             let body = http_resp.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Open-Meteo returned {status} for {model}/{city_slug}: {}",
+                "Open-Meteo returned {status} for {city_slug}: {}",
                 &body[..body.len().min(200)]
             );
         }
@@ -263,102 +366,48 @@ impl WeatherFetcher {
             })
             .collect();
 
-        let mut result = HashMap::new();
+        // Parse per-model member data from combined response.
+        // Keys are: temperature_2m_max_member{i:02}_{response_suffix}
+        let mut model_data: Vec<(&ModelConfig, HashMap<NaiveDate, Vec<f64>>)> = Vec::new();
 
-        for (date_idx, date) in dates.iter().enumerate() {
-            let mut member_temps = Vec::new();
+        for mc in MODEL_CONFIGS {
+            let mut per_date: HashMap<NaiveDate, Vec<f64>> = HashMap::new();
 
-            for i in 1..=(max_members + 10) {
-                let key = format!("temperature_2m_max_member{i:02}");
-                if let Some(val) = daily
-                    .get(&key)
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.get(date_idx))
-                    .and_then(|v| v.as_f64())
-                {
-                    member_temps.push(val);
+            for i in 1..=(mc.max_members + 10) {
+                let key = format!("temperature_2m_max_member{i:02}_{}", mc.response_suffix);
+                let arr = match daily.get(&key).and_then(|v| v.as_array()) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                for (date_idx, date) in dates.iter().enumerate() {
+                    if let Some(val) = arr.get(date_idx).and_then(|v| v.as_f64()) {
+                        per_date.entry(*date).or_default().push(val);
+                    }
                 }
             }
 
-            if !member_temps.is_empty() {
-                result.insert(*date, member_temps);
+            if !per_date.is_empty() {
+                tracing::debug!(
+                    "Weather: {} returned {} dates for {city_slug} (combined)",
+                    mc.name,
+                    per_date.len(),
+                );
+                model_data.push((mc, per_date));
+            } else {
+                tracing::warn!("Weather: {} returned 0 members for {city_slug}", mc.name);
             }
         }
 
-        tracing::debug!(
-            "Weather: {model} returned {} dates for {city_slug}",
-            result.len(),
-        );
-
-        Ok(result)
-    }
-
-    /// Fetch ensemble forecasts from 3 models concurrently (GFS + ECMWF + ICON).
-    /// Merges all member temperatures into one vector per date.
-    /// Skips any model that fails (bails only if ALL 3 fail).
-    pub async fn fetch_multi_model_ensemble(
-        &self,
-        city_slug: &str,
-        lat: f64,
-        lon: f64,
-        fahrenheit: bool,
-        timezone: &str,
-    ) -> Result<HashMap<NaiveDate, CityForecast>> {
-        let models: &[(&str, &str, u32)] = &[
-            ("GFS", "gfs_seamless", 30),
-            ("ECMWF", "ecmwf_ifs025", 51),
-            ("ICON", "icon_seamless", 40),
-        ];
-
-        let (gfs, ecmwf, icon) = tokio::join!(
-            self.fetch_single_model(
-                models[0].1,
-                models[0].2,
-                city_slug,
-                lat,
-                lon,
-                fahrenheit,
-                timezone
-            ),
-            self.fetch_single_model(
-                models[1].1,
-                models[1].2,
-                city_slug,
-                lat,
-                lon,
-                fahrenheit,
-                timezone
-            ),
-            self.fetch_single_model(
-                models[2].1,
-                models[2].2,
-                city_slug,
-                lat,
-                lon,
-                fahrenheit,
-                timezone
-            ),
-        );
-
-        let results: Vec<(&str, HashMap<NaiveDate, Vec<f64>>)> =
-            [("GFS", gfs), ("ECMWF", ecmwf), ("ICON", icon)]
-                .into_iter()
-                .filter_map(|(name, r)| match r {
-                    Ok(data) => Some((name, data)),
-                    Err(e) => {
-                        tracing::warn!("Weather: {name} failed for {city_slug}: {e}");
-                        None
-                    }
-                })
-                .collect();
-
-        if results.is_empty() {
-            anyhow::bail!("All 3 weather models failed for {city_slug}");
+        if model_data.is_empty() {
+            anyhow::bail!(
+                "All {} weather models returned 0 members for {city_slug}",
+                MODEL_CONFIGS.len()
+            );
         }
 
         // Collect all dates across all models
         let mut all_dates: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
-        for (_, data) in &results {
+        for (_, data) in &model_data {
             all_dates.extend(data.keys());
         }
 
@@ -369,15 +418,15 @@ impl WeatherFetcher {
             let mut breakdown = Vec::new();
             let mut per_model = Vec::new();
 
-            for &(name, ref data) in &results {
+            for &(mc, ref data) in &model_data {
                 if let Some(temps) = data.get(&date) {
-                    breakdown.push((name.to_string(), temps.len()));
+                    breakdown.push((mc.name.to_string(), temps.len()));
                     merged_temps.extend(temps);
                     per_model.push(ModelForecast {
-                        name: name.to_string(),
+                        name: mc.name.to_string(),
                         temps: temps.clone(),
-                        weight: model_weight(name),
-                        bias: model_bias(name, fahrenheit),
+                        weight: mc.weight,
+                        bias: if fahrenheit { mc.bias_f } else { mc.bias_c },
                     });
                 }
             }
@@ -394,6 +443,17 @@ impl WeatherFetcher {
                     },
                 );
             }
+        }
+
+        // Cache the assembled forecast
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                city_slug.to_string(),
+                CacheEntry {
+                    fetched_at: Instant::now(),
+                    data: forecasts.clone(),
+                },
+            );
         }
 
         Ok(forecasts)
@@ -559,18 +619,16 @@ pub fn bucket_probability_gaussian(
 
     // Compute std floor based on bucket width to avoid overconfident probabilities.
     // Effective CDF range = (upper - lower + 1) due to half-degree offsets.
-    // Floor = effective_width * 0.5, so:
-    //   Fahrenheit "38-39°F" (lower=38, upper=39): effective=2°F → floor=1.0°F
-    //   Celsius "12°C" (lower=12, upper=12): effective=1°C → floor=0.5°C... still too tight.
-    // Use effective_width * 0.75 to be more conservative:
-    //   Fahrenheit: floor=1.5°F, Celsius: floor=0.75°C
-    // For tail buckets (infinite bounds), use unit-aware floor.
-    // Tail bucket floors (also used as cap for bounded buckets)
-    let tail_floor = if fahrenheit { 1.5 } else { 0.8 };
+    // Use effective_width * 0.75, capped at 2× tail_floor, but never below tail_floor.
+    // Tail bucket floors: Fahrenheit 1.5°F (~0.8°C), Celsius 1.2°C (~2.2°F).
+    // Previous Celsius tail_floor of 0.8 was too tight — both losing weather trades
+    // were Celsius cities (Seoul, London). Increased to 1.2 for consistency with Fahrenheit.
+    let tail_floor = if fahrenheit { 1.5 } else { 1.2 };
     let std_floor = if lower != f64::NEG_INFINITY && upper != f64::INFINITY {
         let effective_width = upper - lower + 1.0;
-        // Cap at 2× tail floor to prevent absurdly wide floors on wide buckets
-        (effective_width * 0.75).min(tail_floor * 2.0)
+        let width_floor = (effective_width * 0.75).min(tail_floor * 2.0);
+        // Never go below tail_floor — single-degree buckets shouldn't be tighter than tails
+        width_floor.max(tail_floor)
     } else {
         tail_floor
     };
@@ -602,6 +660,8 @@ pub fn bucket_probability_gaussian(
                 corrected_max = c;
             }
         }
+        // Bessel's correction: divide by (n-1) for sample variance.
+        // With 30 GFS members, population variance understates std by ~1.7%.
         let variance: f64 = model
             .temps
             .iter()
@@ -610,7 +670,7 @@ pub fn bucket_probability_gaussian(
                 (corrected - mean) * (corrected - mean)
             })
             .sum::<f64>()
-            / n;
+            / if n > 1.0 { n - 1.0 } else { 1.0 };
         let std = variance.sqrt();
 
         // Inflate std to account for ensemble underdispersion.

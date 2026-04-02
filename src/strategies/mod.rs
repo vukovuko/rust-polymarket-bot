@@ -1,3 +1,4 @@
+pub mod paper_tracker;
 pub mod settlement_logger;
 pub mod weather;
 

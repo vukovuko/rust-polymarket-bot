@@ -150,7 +150,24 @@
       "WebFetch(domain:bettingonweather.com)",
       "WebFetch(domain:www.visualcrossing.com)",
       "WebFetch(domain:confluence.ecmwf.int)",
-      "WebFetch(domain:www.timeanddate.com)"
+      "WebFetch(domain:www.timeanddate.com)",
+      "WebFetch(domain:openmeteo.substack.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(echo === Suspicious price values ===:*)",
+      "Bash(chmod +x:*)",
+      "Bash(bash:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "WebFetch(domain:journals.ametsoc.org)",
+      "WebFetch(domain:content.meteoblue.com)",
+      "WebFetch(domain:sites.stat.washington.edu)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:repository.library.noaa.gov)",
+      "WebFetch(domain:severeweather.wmo.int)",
+      "WebFetch(domain:researchgate.net)",
+      "WebFetch(domain:www.researchgate.net)",
+      "WebFetch(domain:users.rust-lang.org)",
+      "Bash(docker-compose logs:*)"
     ]
   }
 }

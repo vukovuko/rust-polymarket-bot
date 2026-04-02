@@ -2,20 +2,21 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Timelike;
-use polymarket_client_sdk::clob::ws::Client as WsClient;
 use polymarket_client_sdk::types::U256;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::health::BotHealth;
 use crate::polymarket::market_finder::MarketFinder;
 use crate::polymarket::types::WeatherMarket;
-use crate::polymarket::ws::SharedBestAsks;
+use crate::polymarket::ws::{SharedBestAsks, SharedWsClient};
 use crate::weather::{self, WeatherFetcher};
 
 use super::StrategyAction;
+use super::paper_tracker::PaperTracker;
 
 /// Max tokens per WS subscribe call (same as PolyWs).
 const SUBSCRIBE_BATCH_SIZE: usize = 100;
@@ -49,7 +50,9 @@ pub struct WeatherStrategy {
     best_asks: SharedBestAsks,
     action_tx: mpsc::UnboundedSender<StrategyAction>,
     config: Arc<Config>,
-    ws_client: WsClient,
+    ws_rx: SharedWsClient,
+    health: Arc<BotHealth>,
+    paper_tracker: Arc<PaperTracker>,
     /// Token IDs we've already subscribed to on the WS (avoid re-subscribing).
     subscribed_tokens: HashSet<U256>,
 }
@@ -61,7 +64,9 @@ impl WeatherStrategy {
         best_asks: SharedBestAsks,
         action_tx: mpsc::UnboundedSender<StrategyAction>,
         config: Arc<Config>,
-        ws_client: WsClient,
+        ws_rx: SharedWsClient,
+        health: Arc<BotHealth>,
+        paper_tracker: Arc<PaperTracker>,
     ) -> Self {
         WeatherStrategy {
             weather,
@@ -69,13 +74,15 @@ impl WeatherStrategy {
             best_asks,
             action_tx,
             config,
-            ws_client,
+            ws_rx,
+            health,
+            paper_tracker,
             subscribed_tokens: HashSet::new(),
         }
     }
 
     pub async fn run(mut self) {
-        tracing::info!("Weather strategy started (alert-only mode)");
+        tracing::info!("Weather strategy started ({})", if self.config.alert_only { "alert-only" } else { "LIVE" });
 
         // Ensure logs directory exists
         if let Err(e) = std::fs::create_dir_all("logs") {
@@ -122,8 +129,9 @@ impl WeatherStrategy {
         self.send_startup_summary().await;
 
         // Run initial edge scan immediately
-        if let Err(e) = self.scan_for_edges(&mut csv_file, &mut logged_edges).await {
-            tracing::warn!("Initial weather edge scan failed: {e}");
+        match self.scan_for_edges(&mut csv_file, &mut logged_edges).await {
+            Ok(edges) => self.health.weather_scan_complete(edges),
+            Err(e) => tracing::warn!("Initial weather edge scan failed: {e}"),
         }
 
         loop {
@@ -147,19 +155,28 @@ impl WeatherStrategy {
             // Subscribe any newly discovered weather tokens to WS
             self.subscribe_new_weather_tokens().await;
 
-            if let Err(e) = self.scan_for_edges(&mut csv_file, &mut logged_edges).await {
-                tracing::warn!("Weather edge scan failed: {e}");
+            match self.scan_for_edges(&mut csv_file, &mut logged_edges).await {
+                Ok(edges) => self.health.weather_scan_complete(edges),
+                Err(e) => tracing::warn!("Weather edge scan failed: {e}"),
             }
         }
     }
 
     /// Subscribe new weather market tokens and prune expired ones.
-    /// Uses the shared WsClient — new events flow to the same connection and
-    /// get picked up by the BBA stream task in PolyWs.
+    /// Uses the shared WsClient (via watch receiver) — automatically picks up
+    /// the latest connection after PolyWs reconnections.
     async fn subscribe_new_weather_tokens(&mut self) {
+        // Clear tracked subscriptions to force re-subscribe on current WS connection.
+        // After PolyWs reconnects, old subscriptions are lost — clearing ensures
+        // we always re-subscribe all active tokens on the latest connection.
+        self.subscribed_tokens.clear();
+
         let markets = self.market_finder.weather_markets().await;
         let current_tokens: HashSet<U256> =
             markets.iter().map(|wm| wm.market.yes_token_id).collect();
+
+        // Get current WsClient from watch channel (latest connection)
+        let ws = self.ws_rx.borrow().clone();
 
         // Prune expired tokens (no longer in active markets)
         let expired: Vec<U256> = self
@@ -171,7 +188,7 @@ impl WeatherStrategy {
 
         if !expired.is_empty() {
             // Unsubscribe expired tokens from WS to free broadcast buffer
-            if let Err(e) = self.ws_client.unsubscribe_orderbook(&expired) {
+            if let Err(e) = ws.unsubscribe_orderbook(&expired) {
                 tracing::debug!("Weather: failed to unsubscribe expired tokens: {e}");
             }
             for t in &expired {
@@ -198,7 +215,7 @@ impl WeatherStrategy {
             // subscribe_best_bid_ask sends SUBSCRIBE to the server and returns a stream.
             // We drop the returned stream — the existing BBA stream in PolyWs will receive
             // events for these tokens because they share the same underlying WS connection.
-            match self.ws_client.subscribe_best_bid_ask(chunk.to_vec()) {
+            match ws.subscribe_best_bid_ask(chunk.to_vec()) {
                 Ok(_stream) => { /* drop stream; events flow to shared BBA stream */ }
                 Err(e) => {
                     tracing::warn!(
@@ -237,25 +254,33 @@ impl WeatherStrategy {
             dates.insert(wm.date);
         }
 
-        // Check how many have WS price data
+        // Check how many have fresh WS price data
+        let now = Instant::now();
         let ws_count = markets
             .iter()
             .filter(|wm| {
                 self.best_asks
                     .read()
                     .ok()
-                    .and_then(|asks| asks.get(&wm.market.yes_token_id).copied())
+                    .and_then(|asks| {
+                        asks.get(&wm.market.yes_token_id)
+                            .filter(|(_, seen_at)| {
+                                now.duration_since(*seen_at) <= Self::WS_PRICE_MAX_AGE
+                            })
+                            .map(|(p, _)| *p)
+                    })
                     .is_some()
             })
             .count();
 
+        let mode = if self.config.alert_only { "ALERT ONLY (no orders)" } else { "🔴 LIVE TRADING" };
         let msg = format!(
             "🌡️ <b>Weather Bot Started</b>\n\
              Markets: {} buckets across {} cities, {} dates\n\
              WS prices: {}/{} buckets have live data\n\
              Edge threshold: {:.0}%\n\
              Scan interval: {}s\n\
-             Mode: ALERT ONLY (no orders)",
+             Mode: {mode}",
             markets.len(),
             cities.len(),
             dates.len(),
@@ -295,12 +320,12 @@ impl WeatherStrategy {
         &self,
         csv_file: &mut File,
         logged_edges: &mut std::collections::HashSet<(String, chrono::NaiveDate, String)>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         let weather_markets = self.market_finder.weather_markets().await;
 
         if weather_markets.is_empty() {
             tracing::warn!("Weather: no markets to scan (cache is empty)");
-            return Ok(());
+            return Ok(0);
         }
 
         tracing::debug!("Weather: scanning {} cached markets", weather_markets.len());
@@ -324,26 +349,51 @@ impl WeatherStrategy {
         let mut gamma_price_count = 0u32;
         let mut stale_skip_count = 0u32;
 
-        for ((city_slug, date), market_indices) in &city_dates {
-            let (lat, lon, fahrenheit, timezone) = match MarketFinder::weather_city(city_slug) {
-                Some(c) => c,
-                None => continue,
-            };
+        let mut rate_limited = false;
 
-            // Rate-limit: 500ms between city-date calls (each makes 3 concurrent model requests).
-            // 84 calls / 28 city-dates / 500ms = ~14s total, ~6 req/s — safely under Open-Meteo 600/min.
+        for ((city_slug, date), market_indices) in &city_dates {
+            if rate_limited {
+                continue;
+            }
+
+            let (lat, lon, fahrenheit, timezone, utc_offset) =
+                match MarketFinder::weather_city(city_slug) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+            // Skip dates already past in the city's local timezone
+            let utc_now = chrono::Utc::now();
+            let local_approx = utc_now + chrono::Duration::hours(utc_offset as i64);
+            let local_date = local_approx.date_naive();
+            if *date < local_date {
+                tracing::debug!(
+                    "Weather: skipping {city_slug} {date} — past in local time (UTC{utc_offset:+})"
+                );
+                continue;
+            }
+
+            // Rate-limit: 500ms between city-date calls.
             if forecast_calls > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             forecast_calls += 1;
 
-            // Fetch multi-model ensemble forecast (GFS + ECMWF + ICON)
+            // Fetch multi-model ensemble forecast (single combined API call, all models)
             let forecasts = match self
                 .weather
-                .fetch_multi_model_ensemble(city_slug, lat, lon, fahrenheit, timezone)
+                .fetch_combined_models(city_slug, lat, lon, fahrenheit, timezone)
                 .await
             {
                 Ok(f) => f,
+                Err(e) if e.to_string().contains("429") => {
+                    let remaining = city_dates.len() as u32 - forecast_calls;
+                    tracing::warn!(
+                        "Weather: Open-Meteo rate limit hit — skipping remaining {remaining} cities"
+                    );
+                    rate_limited = true;
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!("Weather: forecast failed for {city_slug} {date}: {e}");
                     continue;
@@ -390,6 +440,13 @@ impl WeatherStrategy {
                     continue;
                 }
 
+                // Only bet on "at least X" tail buckets (bucket_upper == INFINITY).
+                // Range buckets (0W/10) and "at most" tails (0W/6) have 0% win rate
+                // in paper trading. This filter alone turns -$5 into +$55.
+                if wm.bucket_upper != f64::INFINITY {
+                    continue;
+                }
+
                 // Skip phantom/dead markets — $0.001 means empty order book, not a real ask.
                 // Anything below ~$0.03 is either no liquidity or the market genuinely
                 // sees near-zero probability (in which case our model shouldn't override it).
@@ -402,12 +459,24 @@ impl WeatherStrategy {
                     continue;
                 }
 
+                // Adjust std inflation by lead time: longer forecasts need wider spread.
+                // Day+0: 0.83× base (≈1.5 if base=1.8) — freshest data, least uncertainty
+                // Day+1: 1.0× base (≈1.8) — standard
+                // Day+2: 1.22× base (≈2.2) — high uncertainty, penalize false edges
+                let lead_days = (*date - local_date).num_days();
+                let lead_factor = match lead_days {
+                    0 => 0.83,
+                    1 => 1.0,
+                    _ => 1.22,
+                };
+                let adjusted_std_inflation = self.config.std_inflation * lead_factor;
+
                 // Calculate forecast probability using Gaussian CDF with bias correction
                 let gbp = weather::bucket_probability_gaussian(
                     forecast,
                     wm.bucket_lower,
                     wm.bucket_upper,
-                    self.config.std_inflation,
+                    adjusted_std_inflation,
                     self.config.apply_bias_correction,
                     wm.fahrenheit,
                 );
@@ -439,9 +508,10 @@ impl WeatherStrategy {
                     let full_kelly = edge / (1.0 - market_price);
                     let kelly_bet =
                         (full_kelly * self.config.kelly_fraction * self.config.bankroll).max(0.0);
-                    // Cap at max weather position size
+                    // Cap at max weather position size AND max trade size (risk manager limit)
                     let max_pos = decimal_to_f64(self.config.max_weather_position);
-                    let kelly_bet = kelly_bet.min(max_pos);
+                    let max_trade = decimal_to_f64(self.config.max_trade_usd);
+                    let kelly_bet = kelly_bet.min(max_pos).min(max_trade);
 
                     let unit = if wm.fahrenheit { "F" } else { "C" };
                     let model_info = forecast
@@ -459,7 +529,8 @@ impl WeatherStrategy {
                          Kelly: ${:.2} ({:.0}% Kelly × {:.0}% bankroll)\n\
                          Ensemble: mean {:.1}°{unit}, std {:.1}° (inflated {:.1}°)\n\
                          Range: {:.1}–{:.1}°{unit}\n\
-                         ⚠️ ALERT ONLY — no order placed",
+                         {}",
+
                         wm.city_name,
                         wm.date.format("%b %-d"),
                         wm.bucket_label(),
@@ -480,6 +551,7 @@ impl WeatherStrategy {
                         gbp.inflated_std,
                         gbp.corrected_min,
                         gbp.corrected_max,
+                        if self.config.alert_only { "⚠️ ALERT ONLY — no order placed" } else { "🔴 LIVE — placing order" },
                     );
 
                     tracing::info!(
@@ -495,6 +567,43 @@ impl WeatherStrategy {
                     );
 
                     let _ = self.action_tx.send(StrategyAction::Alert(msg));
+
+                    // Place real order if not in alert-only mode
+                    if !self.config.alert_only && kelly_bet > 0.0 && market_price > 0.01 {
+                        let price_dec = f64_to_decimal(market_price);
+                        // Floor shares to 2 decimals to avoid rounding up past budget
+                        let size_dec = f64_to_decimal_floor(kelly_bet / market_price);
+                        let reason = format!(
+                            "Weather: {} {} {} (f={:.0}% m={:.0}% edge=+{:.1}%)",
+                            wm.city_name,
+                            wm.date.format("%b %-d"),
+                            wm.bucket_label(),
+                            gbp.prob * 100.0,
+                            market_price * 100.0,
+                            edge * 100.0,
+                        );
+                        let _ = self.action_tx.send(StrategyAction::PlaceOrder {
+                            token_id: wm.market.yes_token_id,
+                            price: price_dec,
+                            size: size_dec,
+                            reason,
+                        });
+                    }
+
+                    // Track for outcome verification
+                    self.paper_tracker.add_pending_weather(
+                        &wm.market.condition_id,
+                        &wm.city_name,
+                        &wm.city_slug,
+                        wm.date,
+                        &wm.bucket_label(),
+                        gbp.prob,
+                        market_price,
+                        edge,
+                        kelly_bet,
+                        &model_info,
+                        wm.market.end_date,
+                    );
 
                     // Log edge to CSV
                     let _ = writeln!(
@@ -530,7 +639,7 @@ impl WeatherStrategy {
         let _ = csv_file.flush();
 
         tracing::info!(
-            "Weather scan: {} edges, {}/{} buckets with prices (WS: {}, Gamma: {}, skipped stale: {}), {} no price, {} forecast API calls",
+            "Weather scan: {} edges, {}/{} buckets with prices (WS: {}, Gamma: {}, skipped stale: {}), {} no price, {} forecast API calls, {} cached models",
             total_edges,
             total_scanned - no_price_count,
             total_scanned,
@@ -539,21 +648,28 @@ impl WeatherStrategy {
             stale_skip_count,
             no_price_count,
             forecast_calls,
+            self.weather.cache_size(),
         );
 
-        Ok(())
+        Ok(total_edges)
     }
+
+    /// Max age for a WS price to be considered fresh for weather edge detection.
+    const WS_PRICE_MAX_AGE: Duration = Duration::from_secs(300);
 
     /// Get market price for a weather bucket.
     /// Returns the price and its source, or None if no price is available.
     fn get_market_price(&self, wm: &WeatherMarket) -> Option<PriceSource> {
         // Try real-time WS data first
         if let Ok(asks) = self.best_asks.read() {
-            if let Some(&ask) = asks.get(&wm.market.yes_token_id) {
-                let price = decimal_to_f64(ask);
-                if price > 0.0 {
-                    return Some(PriceSource::Ws(price));
+            if let Some(&(ask, seen_at)) = asks.get(&wm.market.yes_token_id) {
+                if seen_at.elapsed() <= Self::WS_PRICE_MAX_AGE {
+                    let price = decimal_to_f64(ask);
+                    if price > 0.0 {
+                        return Some(PriceSource::Ws(price));
+                    }
                 }
+                // WS price exists but is stale — fall through to Gamma
             }
         }
 
@@ -569,6 +685,20 @@ impl WeatherStrategy {
 fn decimal_to_f64(d: polymarket_client_sdk::types::Decimal) -> f64 {
     use std::str::FromStr;
     f64::from_str(&d.to_string()).unwrap_or(0.0)
+}
+
+fn f64_to_decimal(v: f64) -> polymarket_client_sdk::types::Decimal {
+    use std::str::FromStr;
+    // 2 decimal places: respects 0.01 tick size and LOT_SIZE_SCALE=2
+    polymarket_client_sdk::types::Decimal::from_str(&format!("{:.2}", v)).unwrap_or_default()
+}
+
+/// Like f64_to_decimal but floors instead of rounding.
+/// Used for share sizes to avoid rounding up past the budget.
+fn f64_to_decimal_floor(v: f64) -> polymarket_client_sdk::types::Decimal {
+    use std::str::FromStr;
+    let floored = (v * 100.0).floor() / 100.0;
+    polymarket_client_sdk::types::Decimal::from_str(&format!("{:.2}", floored)).unwrap_or_default()
 }
 
 /// Format a bucket bound for CSV (infinity values as -inf/inf).

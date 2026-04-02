@@ -29,6 +29,8 @@ pub struct Config {
     // Kelly sizing
     pub bankroll: f64,
     pub kelly_fraction: f64,
+    // Market refresh
+    pub market_refresh_interval_secs: u64,
 }
 
 impl Config {
@@ -67,6 +69,7 @@ impl Config {
         let require_ws_price = env_bool("REQUIRE_WS_PRICE", false);
         let bankroll = env_f64("BANKROLL", "77")?;
         let kelly_fraction = env_f64("KELLY_FRACTION", "0.25")?;
+        let market_refresh_interval_secs = env_u64("MARKET_REFRESH_INTERVAL", "60")?;
 
         Ok(Config {
             private_key,
@@ -93,6 +96,7 @@ impl Config {
             require_ws_price,
             bankroll,
             kelly_fraction,
+            market_refresh_interval_secs,
         })
     }
 
@@ -141,6 +145,10 @@ impl Config {
             "  Kelly: {:.0}% of ${:.0} bankroll",
             self.kelly_fraction * 100.0,
             self.bankroll,
+        );
+        tracing::info!(
+            "  Market refresh interval: {}s",
+            self.market_refresh_interval_secs,
         );
     }
 }

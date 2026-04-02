@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use polymarket_client_sdk::types::Utc;
 use tokio::sync::{mpsc, watch};
@@ -16,6 +17,10 @@ const LOG_START_SECS: u64 = 60;
 const LOG_INTERVAL_SECS: u64 = 5;
 /// Window duration in seconds.
 const WINDOW_SECS: u64 = 300;
+/// Max age for BTC price to be considered fresh.
+const BTC_PRICE_MAX_AGE: Duration = Duration::from_secs(30);
+/// Max age for Polymarket best_ask to be considered fresh.
+const POLY_PRICE_MAX_AGE: Duration = Duration::from_secs(120);
 
 pub struct SettlementLogger {
     price_rx: watch::Receiver<Option<PriceSignal>>,
@@ -90,9 +95,18 @@ impl SettlementLogger {
             let window_end = window_start + WINDOW_SECS;
             let time_remaining = window_end.saturating_sub(now_unix);
 
-            // Get current BTC price
+            // Get current BTC price with staleness check
             let btc_price = match *self.price_rx.borrow() {
-                Some((_change, price)) => price,
+                Some((price, received_at)) => {
+                    if received_at.elapsed() > BTC_PRICE_MAX_AGE {
+                        tracing::warn!(
+                            "Settlement: BTC price stale ({:.0}s old) — skipping",
+                            received_at.elapsed().as_secs_f64(),
+                        );
+                        continue;
+                    }
+                    price
+                }
                 None => continue, // No price yet
             };
 
@@ -170,13 +184,34 @@ impl SettlementLogger {
                 }
             };
 
-            // Read best_asks for Up and Down tokens
+            // Read best_asks for Up and Down tokens with staleness check
             let (up_ask, down_ask) = {
                 let asks = self.best_asks.read().unwrap_or_else(|e| e.into_inner());
-                let up = asks.get(&market.yes_token_id).copied();
-                let down = asks.get(&market.no_token_id).copied();
+                let up = asks
+                    .get(&market.yes_token_id)
+                    .and_then(|&(price, seen_at)| {
+                        if seen_at.elapsed() > POLY_PRICE_MAX_AGE {
+                            None
+                        } else {
+                            Some(price)
+                        }
+                    });
+                let down = asks.get(&market.no_token_id).and_then(|&(price, seen_at)| {
+                    if seen_at.elapsed() > POLY_PRICE_MAX_AGE {
+                        None
+                    } else {
+                        Some(price)
+                    }
+                });
                 (up, down)
             };
+
+            if up_ask.is_none() && down_ask.is_none() {
+                tracing::warn!(
+                    "Settlement T-{bucket}s: both Up and Down prices stale/missing — skipping"
+                );
+                continue;
+            }
 
             let distance_usd = (btc_price - state.btc_start_price).abs();
             let distance_pct = if state.btc_start_price > 0.0 {

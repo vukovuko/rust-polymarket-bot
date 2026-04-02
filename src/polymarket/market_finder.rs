@@ -27,6 +27,9 @@ pub struct WeatherCity {
     /// IANA timezone for Open-Meteo daily aggregation.
     /// Critical: without this, daily max is computed over UTC day, not local day.
     pub timezone: &'static str,
+    /// Approximate UTC offset (DST-active value for cities with DST, ±1h is fine).
+    /// Used to skip past-date markets without pulling in a full tz library.
+    pub utc_offset_hours: i32,
 }
 
 /// Coordinates match the actual Weather Underground resolution stations (ICAO airports).
@@ -39,6 +42,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -73.87,
         fahrenheit: true,
         timezone: "America/New_York",
+        utc_offset_hours: -4,
     },
     WeatherCity {
         slug: "chicago",
@@ -47,6 +51,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -87.90,
         fahrenheit: true,
         timezone: "America/Chicago",
+        utc_offset_hours: -5,
     },
     WeatherCity {
         slug: "miami",
@@ -55,6 +60,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -80.29,
         fahrenheit: true,
         timezone: "America/New_York",
+        utc_offset_hours: -4,
     },
     WeatherCity {
         slug: "atlanta",
@@ -63,6 +69,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -84.43,
         fahrenheit: true,
         timezone: "America/New_York",
+        utc_offset_hours: -4,
     },
     WeatherCity {
         slug: "dallas",
@@ -71,6 +78,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -96.85,
         fahrenheit: true,
         timezone: "America/Chicago",
+        utc_offset_hours: -5,
     },
     WeatherCity {
         slug: "seattle",
@@ -79,6 +87,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -122.31,
         fahrenheit: true,
         timezone: "America/Los_Angeles",
+        utc_offset_hours: -7,
     },
     WeatherCity {
         slug: "london",
@@ -87,6 +96,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: 0.05,
         fahrenheit: false,
         timezone: "Europe/London",
+        utc_offset_hours: 1,
     },
     WeatherCity {
         slug: "paris",
@@ -95,6 +105,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: 2.55,
         fahrenheit: false,
         timezone: "Europe/Paris",
+        utc_offset_hours: 2,
     },
     WeatherCity {
         slug: "seoul",
@@ -103,6 +114,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: 126.44,
         fahrenheit: false,
         timezone: "Asia/Seoul",
+        utc_offset_hours: 9,
     },
     WeatherCity {
         slug: "toronto",
@@ -111,6 +123,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -79.63,
         fahrenheit: false,
         timezone: "America/Toronto",
+        utc_offset_hours: -4,
     },
     WeatherCity {
         slug: "ankara",
@@ -119,6 +132,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: 32.99,
         fahrenheit: false,
         timezone: "Europe/Istanbul",
+        utc_offset_hours: 3,
     },
     WeatherCity {
         slug: "buenos-aires",
@@ -127,6 +141,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -58.54,
         fahrenheit: false,
         timezone: "America/Argentina/Buenos_Aires",
+        utc_offset_hours: -3,
     },
     WeatherCity {
         slug: "wellington",
@@ -135,6 +150,7 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: 174.81,
         fahrenheit: false,
         timezone: "Pacific/Auckland",
+        utc_offset_hours: 13,
     },
     WeatherCity {
         slug: "sao-paulo",
@@ -143,6 +159,188 @@ pub const WEATHER_CITIES: &[WeatherCity] = &[
         lon: -46.47,
         fahrenheit: false,
         timezone: "America/Sao_Paulo",
+        utc_offset_hours: -3,
+    },
+    // Verified on Polymarket — stations confirmed against resolution rules
+    WeatherCity {
+        slug: "los-angeles",
+        name: "Los Angeles",
+        lat: 33.94, // KLAX (Los Angeles International)
+        lon: -118.41,
+        fahrenheit: true,
+        timezone: "America/Los_Angeles",
+        utc_offset_hours: -7,
+    },
+    WeatherCity {
+        slug: "denver",
+        name: "Denver",
+        lat: 39.70, // KBKF (Buckley Space Force Base, Aurora CO)
+        lon: -104.75,
+        fahrenheit: true,
+        timezone: "America/Denver",
+        utc_offset_hours: -6,
+    },
+    WeatherCity {
+        slug: "houston",
+        name: "Houston",
+        lat: 29.65, // KHOU (William P. Hobby Airport)
+        lon: -95.28,
+        fahrenheit: true,
+        timezone: "America/Chicago",
+        utc_offset_hours: -5,
+    },
+    WeatherCity {
+        slug: "tokyo",
+        name: "Tokyo",
+        lat: 35.55, // RJTT (Haneda Airport)
+        lon: 139.78,
+        fahrenheit: false,
+        timezone: "Asia/Tokyo",
+        utc_offset_hours: 9,
+    },
+    WeatherCity {
+        slug: "san-francisco",
+        name: "San Francisco",
+        lat: 37.62, // KSFO (San Francisco International)
+        lon: -122.38,
+        fahrenheit: true,
+        timezone: "America/Los_Angeles",
+        utc_offset_hours: -7,
+    },
+    WeatherCity {
+        slug: "hong-kong",
+        name: "Hong Kong",
+        lat: 22.31, // VHHH (Hong Kong International)
+        lon: 113.92,
+        fahrenheit: false,
+        timezone: "Asia/Hong_Kong",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "taipei",
+        name: "Taipei",
+        lat: 25.08, // RCTP (Taiwan Taoyuan International)
+        lon: 121.23,
+        fahrenheit: false,
+        timezone: "Asia/Taipei",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "shanghai",
+        name: "Shanghai",
+        lat: 31.14, // ZSPD (Shanghai Pudong International)
+        lon: 121.81,
+        fahrenheit: false,
+        timezone: "Asia/Shanghai",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "beijing",
+        name: "Beijing",
+        lat: 40.08, // ZBAA (Beijing Capital International)
+        lon: 116.58,
+        fahrenheit: false,
+        timezone: "Asia/Shanghai",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "madrid",
+        name: "Madrid",
+        lat: 40.47, // LEMD (Adolfo Suárez Madrid-Barajas)
+        lon: -3.56,
+        fahrenheit: false,
+        timezone: "Europe/Madrid",
+        utc_offset_hours: 2,
+    },
+    WeatherCity {
+        slug: "munich",
+        name: "Munich",
+        lat: 48.35, // EDDM (Munich Airport)
+        lon: 11.79,
+        fahrenheit: false,
+        timezone: "Europe/Berlin",
+        utc_offset_hours: 2,
+    },
+    WeatherCity {
+        slug: "singapore",
+        name: "Singapore",
+        lat: 1.35, // WSSS (Singapore Changi)
+        lon: 103.99,
+        fahrenheit: false,
+        timezone: "Asia/Singapore",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "istanbul",
+        name: "Istanbul",
+        lat: 41.26, // LTFM (Istanbul Airport)
+        lon: 28.74,
+        fahrenheit: false,
+        timezone: "Europe/Istanbul",
+        utc_offset_hours: 3,
+    },
+    WeatherCity {
+        slug: "austin",
+        name: "Austin",
+        lat: 30.19, // KAUS (Austin-Bergstrom International)
+        lon: -97.67,
+        fahrenheit: true,
+        timezone: "America/Chicago",
+        utc_offset_hours: -5,
+    },
+    WeatherCity {
+        slug: "mexico-city",
+        name: "Mexico City",
+        lat: 19.44, // MMMX (Benito Juárez International)
+        lon: -99.07,
+        fahrenheit: false,
+        timezone: "America/Mexico_City",
+        utc_offset_hours: -6,
+    },
+    WeatherCity {
+        slug: "moscow",
+        name: "Moscow",
+        lat: 55.60, // UUWW (Vnukovo International)
+        lon: 37.27,
+        fahrenheit: false,
+        timezone: "Europe/Moscow",
+        utc_offset_hours: 3,
+    },
+    WeatherCity {
+        slug: "milan",
+        name: "Milan",
+        lat: 45.63, // LIMC (Malpensa International)
+        lon: 8.72,
+        fahrenheit: false,
+        timezone: "Europe/Rome",
+        utc_offset_hours: 2,
+    },
+    WeatherCity {
+        slug: "lucknow",
+        name: "Lucknow",
+        lat: 26.76, // VILK (Chaudhary Charan Singh International)
+        lon: 80.88,
+        fahrenheit: false,
+        timezone: "Asia/Kolkata",
+        utc_offset_hours: 5,
+    },
+    WeatherCity {
+        slug: "chongqing",
+        name: "Chongqing",
+        lat: 29.72, // ZUCK (Chongqing Jiangbei International)
+        lon: 106.64,
+        fahrenheit: false,
+        timezone: "Asia/Shanghai",
+        utc_offset_hours: 8,
+    },
+    WeatherCity {
+        slug: "shenzhen",
+        name: "Shenzhen",
+        lat: 22.64, // ZGSZ (Shenzhen Bao'an International)
+        lon: 113.81,
+        fahrenheit: false,
+        timezone: "Asia/Shanghai",
+        utc_offset_hours: 8,
     },
 ];
 
@@ -365,6 +563,8 @@ impl MarketFinder {
 
     /// Add a single market (e.g. from a WebSocket new_market event).
     /// Skips duplicates by condition_id.
+    /// Currently unused: NewMarket WS stream was removed (SDK limitation).
+    #[allow(dead_code)]
     pub async fn add_market(&self, market: BotMarket) {
         let mut markets = self.all_markets.write().await;
         let already_exists = markets
@@ -390,7 +590,7 @@ impl MarketFinder {
 
     /// Refresh weather markets for all cities × next N days via Gamma API.
     /// Adds 150ms delay between requests to avoid rate limiting.
-    /// Total: 14 cities × 2 days = 28 requests, ~4.2s total.
+    /// Total: 22 cities × 3 days = 66 requests, ~10s total.
     pub async fn refresh_weather(&self) -> Result<()> {
         let today = Utc::now().date_naive();
         let mut new_markets = Vec::new();
@@ -585,12 +785,12 @@ impl MarketFinder {
     }
 
     /// Get weather city config by slug (for forecast fetching).
-    /// Returns (lat, lon, fahrenheit, timezone).
-    pub fn weather_city(slug: &str) -> Option<(f64, f64, bool, &'static str)> {
+    /// Returns (lat, lon, fahrenheit, timezone, utc_offset_hours).
+    pub fn weather_city(slug: &str) -> Option<(f64, f64, bool, &'static str, i32)> {
         WEATHER_CITIES
             .iter()
             .find(|c| c.slug == slug)
-            .map(|c| (c.lat, c.lon, c.fahrenheit, c.timezone))
+            .map(|c| (c.lat, c.lon, c.fahrenheit, c.timezone, c.utc_offset_hours))
     }
 }
 

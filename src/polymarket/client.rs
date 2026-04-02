@@ -69,6 +69,28 @@ impl PolyClient {
         Ok(markets)
     }
 
+    /// Fetch order book and return (best_ask_price, total_size_at_best_ask).
+    /// Returns None-like error if no asks exist.
+    pub async fn get_best_ask(&self, token_id: U256) -> Result<(Decimal, Decimal)> {
+        use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
+        let request = OrderBookSummaryRequest::builder()
+            .token_id(token_id)
+            .build();
+        let book = self
+            .clob
+            .order_book(&request)
+            .await
+            .context("Failed to fetch order book")?;
+
+        let best = book
+            .asks
+            .iter()
+            .min_by_key(|a| a.price)
+            .context("No asks in order book")?;
+
+        Ok((best.price, best.size))
+    }
+
     #[allow(dead_code)]
     pub async fn get_fee_rate(&self, token_id: U256) -> Result<u32> {
         let resp = self
@@ -106,7 +128,6 @@ impl PolyClient {
             .price(price)
             .size(size)
             .order_type(OrderType::GTC)
-            .post_only(true)
             .build()
             .await
             .context("Failed to build limit order")?;

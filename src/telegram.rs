@@ -68,9 +68,16 @@ impl TelegramSender {
         }
     }
 
-    pub async fn alert_startup(&self) {
-        self.send_silent("🤖 <b>Polymarket Bot Starting</b>\nAlert-only mode active.")
-            .await;
+    pub async fn alert_startup(&self, alert_only: bool) {
+        let mode = if alert_only {
+            "Alert-only mode"
+        } else {
+            "LIVE TRADING mode"
+        };
+        self.send_silent(&format!(
+            "🤖 <b>Polymarket Bot Starting</b>\n{mode} active."
+        ))
+        .await;
     }
 
     pub async fn alert_error(&self, context: &str, error: &str) {
