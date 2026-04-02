@@ -169,7 +169,13 @@
       "WebFetch(domain:users.rust-lang.org)",
       "Bash(docker-compose logs:*)",
       "WebFetch(domain:api.polygonscan.com)",
-      "WebFetch(domain:polygonscan.com)"
+      "WebFetch(domain:polygonscan.com)",
+      "Bash(find /home/vuko/.cargo/registry/src -type d -name polymarket*)",
+      "Bash(find /home/vuko/.cargo/registry/src -type d -name py-order-utils*)",
+      "Bash(find /home/vuko/.cargo/registry/src -type d -name clob*)",
+      "Bash(source .env)",
+      "Bash(set -a)",
+      "Bash(set +a)"
     ]
   }
 }

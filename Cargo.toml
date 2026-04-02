@@ -7,6 +7,11 @@ edition = "2024"
 name = "check-edges"
 path = "src/bin/check_edges.rs"
 
+[[bin]]
+name = "check-wallet"
+path = "src/bin/check_wallet.rs"
+
+
 [dependencies]
 anyhow = "1.0.102"
 chrono = "0.4.44"
