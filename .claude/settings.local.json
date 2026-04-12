@@ -5,7 +5,8 @@
       "Bash(dpkg:*)",
       "Bash(curl:*)",
       "Bash(test:*)",
-      "WebSearch",
+      "WebSearch(*)",
+      "WebFetch(*)",
       "Bash(pkg-config:*)",
       "WebFetch(domain:docs.polymarket.com)",
       "WebFetch(domain:github.com)",
@@ -175,7 +176,19 @@
       "Bash(find /home/vuko/.cargo/registry/src -type d -name clob*)",
       "Bash(source .env)",
       "Bash(set -a)",
-      "Bash(set +a)"
+      "Bash(set +a)",
+      "WebFetch(domain:learn.polymarket.com)",
+      "WebFetch(domain:discord.com)",
+      "WebFetch(domain:blog.polymarket.com)",
+      "WebFetch(domain:www.reddit.com)",
+      "WebFetch(domain:old.reddit.com)",
+      "WebFetch(domain:mirror.xyz)",
+      "WebFetch(domain:stackoverflow.com)",
+      "Bash(cargo doc:*)",
+      "WebFetch(domain:pkqs90.github.io)",
+      "WebFetch(domain:docs.safe.global)",
+      "Bash(gh api:*)",
+      "Bash(cargo search:*)"
     ]
   }
 }

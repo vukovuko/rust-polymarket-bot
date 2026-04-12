@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,10 @@ use super::paper_tracker::PaperTracker;
 
 /// Max tokens per WS subscribe call (same as PolyWs).
 const SUBSCRIBE_BATCH_SIZE: usize = 100;
+
+/// Persistent file tracking condition_ids we've already bet on.
+/// Prevents duplicate bets across restarts and midnight dedup resets.
+const BET_CONDITIONS_PATH: &str = "logs/bet_conditions.txt";
 
 /// Where a market price came from.
 enum PriceSource {
@@ -55,6 +59,9 @@ pub struct WeatherStrategy {
     paper_tracker: Arc<PaperTracker>,
     /// Token IDs we've already subscribed to on the WS (avoid re-subscribing).
     subscribed_tokens: HashSet<U256>,
+    /// Condition IDs we've already placed bets on (persistent across restarts).
+    /// Prevents stacking multiple bets on the same market.
+    bet_conditions: HashSet<String>,
 }
 
 impl WeatherStrategy {
@@ -68,6 +75,9 @@ impl WeatherStrategy {
         health: Arc<BotHealth>,
         paper_tracker: Arc<PaperTracker>,
     ) -> Self {
+        // Load persistent bet conditions from file (survives restarts)
+        let bet_conditions = load_bet_conditions();
+
         WeatherStrategy {
             weather,
             market_finder,
@@ -78,6 +88,7 @@ impl WeatherStrategy {
             health,
             paper_tracker,
             subscribed_tokens: HashSet::new(),
+            bet_conditions,
         }
     }
 
@@ -321,7 +332,7 @@ impl WeatherStrategy {
     }
 
     async fn scan_for_edges(
-        &self,
+        &mut self,
         csv_file: &mut File,
         logged_edges: &mut std::collections::HashSet<(String, chrono::NaiveDate, String)>,
     ) -> anyhow::Result<u32> {
@@ -415,6 +426,14 @@ impl WeatherStrategy {
                 }
             };
 
+            // Cross-market consistency check: detect monotonicity violations
+            // and build a set of dominated condition_ids to skip.
+            let dominated = self.check_price_consistency(
+                &weather_markets,
+                market_indices,
+                logged_edges,
+            );
+
             for &idx in market_indices {
                 let wm = &weather_markets[idx];
                 total_scanned += 1;
@@ -504,6 +523,10 @@ impl WeatherStrategy {
                         continue; // already logged this edge today
                     }
 
+                    // Determine skip reasons before building alert message
+                    let is_dominated = dominated.contains(&wm.market.condition_id);
+                    let already_bet = self.bet_conditions.contains(&wm.market.condition_id);
+
                     total_edges += 1;
 
                     // Kelly criterion: optimal bet size for binary outcomes
@@ -524,6 +547,18 @@ impl WeatherStrategy {
                         .map(|(name, count)| format!("{name}:{count}"))
                         .collect::<Vec<_>>()
                         .join("+");
+
+                    // Determine status line for alert — reflects what will actually happen
+                    let status = if is_dominated {
+                        "⛔ DOMINATED — cheaper lower threshold exists, skipping"
+                    } else if self.config.alert_only {
+                        "⚠️ ALERT ONLY — no order placed"
+                    } else if already_bet {
+                        "🔁 ALREADY BET — position exists, skipping"
+                    } else {
+                        "🔴 LIVE — placing order"
+                    };
+
                     let msg = format!(
                         "🌡️ <b>Weather Edge</b>: {} {}\n\
                          Bucket: {}\n\
@@ -533,7 +568,7 @@ impl WeatherStrategy {
                          Kelly: ${:.2} ({:.0}% Kelly × {:.0}% bankroll)\n\
                          Ensemble: mean {:.1}°{unit}, std {:.1}° (inflated {:.1}°)\n\
                          Range: {:.1}–{:.1}°{unit}\n\
-                         {}",
+                         {status}",
 
                         wm.city_name,
                         wm.date.format("%b %-d"),
@@ -555,7 +590,6 @@ impl WeatherStrategy {
                         gbp.inflated_std,
                         gbp.corrected_min,
                         gbp.corrected_max,
-                        if self.config.alert_only { "⚠️ ALERT ONLY — no order placed" } else { "🔴 LIVE — placing order" },
                     );
 
                     tracing::info!(
@@ -573,7 +607,10 @@ impl WeatherStrategy {
                     let _ = self.action_tx.send(StrategyAction::Alert(msg));
 
                     // Place real order if not in alert-only mode
-                    if !self.config.alert_only && kelly_bet > 0.0 && market_price > 0.01 {
+                    let mut order_placed = false;
+                    if !self.config.alert_only && kelly_bet > 0.0 && market_price > 0.01
+                        && !is_dominated && !already_bet
+                    {
                         let price_dec = f64_to_decimal(market_price);
                         // Use the rounded price for sizing so cost = price_dec * size_dec <= kelly_bet
                         let rounded_price = decimal_to_f64(price_dec);
@@ -593,22 +630,31 @@ impl WeatherStrategy {
                             size: size_dec,
                             reason,
                         });
+
+                        // Mark condition_id as bet — persist to file
+                        self.bet_conditions.insert(wm.market.condition_id.clone());
+                        append_bet_condition(&wm.market.condition_id);
+                        order_placed = true;
                     }
 
-                    // Track for outcome verification
-                    self.paper_tracker.add_pending_weather(
-                        &wm.market.condition_id,
-                        &wm.city_name,
-                        &wm.city_slug,
-                        wm.date,
-                        &wm.bucket_label(),
-                        gbp.prob,
-                        market_price,
-                        edge,
-                        kelly_bet,
-                        &model_info,
-                        wm.market.end_date,
-                    );
+                    // Track for outcome verification:
+                    // - In alert_only mode: always track (paper trading)
+                    // - In live mode: only track when an order was actually placed
+                    if self.config.alert_only || order_placed {
+                        self.paper_tracker.add_pending_weather(
+                            &wm.market.condition_id,
+                            &wm.city_name,
+                            &wm.city_slug,
+                            wm.date,
+                            &wm.bucket_label(),
+                            gbp.prob,
+                            market_price,
+                            edge,
+                            kelly_bet,
+                            &model_info,
+                            wm.market.end_date,
+                        );
+                    }
 
                     // Log edge to CSV
                     let _ = writeln!(
@@ -685,6 +731,101 @@ impl WeatherStrategy {
 
         None
     }
+
+    /// Check that tail-above bucket prices decrease monotonically with threshold.
+    /// e.g., P(≥75°F) ≥ P(≥78°F) ≥ P(≥80°F) must hold.
+    /// Returns the set of condition_ids that are "dominated" — a lower threshold
+    /// has equal or lower price, making it strictly better to buy.
+    /// Sends Telegram alerts for violations (deduped via logged_edges).
+    fn check_price_consistency(
+        &self,
+        weather_markets: &[WeatherMarket],
+        market_indices: &[usize],
+        logged_edges: &mut HashSet<(String, chrono::NaiveDate, String)>,
+    ) -> HashSet<String> {
+        let mut dominated = HashSet::new();
+
+        // Collect tail-above buckets with prices: (bucket_lower, price, index)
+        let mut priced_tails: Vec<(f64, f64, usize)> = Vec::new();
+        for &idx in market_indices {
+            let wm = &weather_markets[idx];
+            if wm.bucket_upper != f64::INFINITY {
+                continue; // only tail-above buckets
+            }
+            if let Some(src) = self.get_market_price(wm) {
+                let p = src.price();
+                if p > 0.0 && p < 1.0 {
+                    priced_tails.push((wm.bucket_lower, p, idx));
+                }
+            }
+        }
+
+        if priced_tails.len() < 2 {
+            return dominated;
+        }
+
+        // Sort by threshold ascending: ≥75, ≥78, ≥80
+        priced_tails.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Check monotonicity and detect dominated buckets.
+        // A bucket is dominated if ANY lower threshold has equal/lower price.
+        let mut best_price_so_far = priced_tails[0].1;
+
+        let city_name = &weather_markets[priced_tails[0].2].city_name;
+        let date = weather_markets[priced_tails[0].2].date;
+        let unit = if weather_markets[priced_tails[0].2].fahrenheit { "F" } else { "C" };
+
+        for i in 1..priced_tails.len() {
+            let (_, price, idx) = priced_tails[i];
+
+            if price >= best_price_so_far {
+                // This bucket is dominated: a lower threshold has equal/lower price
+                dominated.insert(weather_markets[idx].market.condition_id.clone());
+            } else {
+                best_price_so_far = price;
+            }
+        }
+
+        // Send alert if any domination found (deduped: once per city/date per day)
+        if !dominated.is_empty() {
+            let dedup_key = (
+                weather_markets[priced_tails[0].2].city_slug.clone(),
+                date,
+                "__price_inconsistency__".to_string(),
+            );
+            if logged_edges.insert(dedup_key) {
+                let all_prices: String = priced_tails
+                    .iter()
+                    .map(|(threshold, price, idx)| {
+                        let cid = &weather_markets[*idx].market.condition_id;
+                        if dominated.contains(cid) {
+                            format!("  ≥{:.0}°{unit} = ${:.3} ⛔", threshold, price)
+                        } else {
+                            format!("  ≥{:.0}°{unit} = ${:.3}", threshold, price)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let msg = format!(
+                    "⚠️ <b>Price Inconsistency</b>: {} {}\n{all_prices}",
+                    city_name, date.format("%b %-d"),
+                );
+                let _ = self.action_tx.send(StrategyAction::Alert(msg));
+            }
+        }
+
+        if !dominated.is_empty() {
+            tracing::info!(
+                "Weather: {} {} — {} dominated buckets skipped",
+                city_name, date, dominated.len(),
+            );
+        }
+
+        dominated
+    }
 }
 
 fn decimal_to_f64(d: polymarket_client_sdk::types::Decimal) -> f64 {
@@ -714,5 +855,53 @@ fn format_bound(v: f64) -> String {
         "inf".to_string()
     } else {
         format!("{v:.1}")
+    }
+}
+
+/// Load condition_ids we've already bet on from persistent file.
+fn load_bet_conditions() -> HashSet<String> {
+    let path = std::path::Path::new(BET_CONDITIONS_PATH);
+    if !path.exists() {
+        tracing::info!("No existing bet conditions file — starting fresh");
+        return HashSet::new();
+    }
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            let reader = std::io::BufReader::new(file);
+            let conditions: HashSet<String> = reader
+                .lines()
+                .filter_map(Result::ok)
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect();
+            tracing::info!(
+                "Loaded {} existing bet condition_ids from {}",
+                conditions.len(),
+                BET_CONDITIONS_PATH,
+            );
+            conditions
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load {BET_CONDITIONS_PATH}: {e} — starting fresh");
+            HashSet::new()
+        }
+    }
+}
+
+/// Append a condition_id to the persistent bet conditions file.
+fn append_bet_condition(condition_id: &str) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(BET_CONDITIONS_PATH)
+    {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{condition_id}") {
+                tracing::warn!("Failed to persist bet condition {condition_id}: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open {BET_CONDITIONS_PATH} for append: {e}");
+        }
     }
 }
