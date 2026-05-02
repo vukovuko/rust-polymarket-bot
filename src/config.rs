@@ -63,7 +63,7 @@ impl Config {
         let weather_fast_scan_interval_secs = env_u64("WEATHER_FAST_SCAN_INTERVAL", "300")?;
         let min_entry_price = env_f64("MIN_ENTRY_PRICE", "0.03")?;
         let max_entry_price = env_f64("MAX_ENTRY_PRICE", "0.65")?;
-        let std_inflation = env_f64("STD_INFLATION", "2.0")?;
+        let std_inflation = env_f64("STD_INFLATION", "1.8")?;
         let slippage_estimate = env_f64("SLIPPAGE_ESTIMATE", "0.02")?;
         let apply_bias_correction = env_bool("APPLY_BIAS_CORRECTION", true);
         let require_ws_price = env_bool("REQUIRE_WS_PRICE", false);

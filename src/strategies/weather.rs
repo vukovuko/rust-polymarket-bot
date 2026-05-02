@@ -363,6 +363,8 @@ impl WeatherStrategy {
         let mut ws_price_count = 0u32;
         let mut gamma_price_count = 0u32;
         let mut stale_skip_count = 0u32;
+        let mut best_near_miss_edge: f64 = f64::NEG_INFINITY;
+        let mut best_near_miss: Option<String> = None;
 
         let mut rate_limited = false;
 
@@ -509,9 +511,17 @@ impl WeatherStrategy {
                 // Additional slippage from thin books and price movement.
                 let edge = gbp.prob - market_price - self.config.slippage_estimate;
 
+                // Track best near-miss (only buckets with prob >= 30%)
+                if gbp.prob >= 0.30 && edge > best_near_miss_edge {
+                    best_near_miss_edge = edge;
+                    best_near_miss = Some(format!(
+                        "{} {} {} — f={:.0}% m={:.0}% e={:+.1}%",
+                        wm.city_name, wm.date.format("%b %-d"), wm.bucket_label(),
+                        gbp.prob * 100.0, market_price * 100.0, edge * 100.0,
+                    ));
+                }
+
                 // Skip unless OUR forecast says it's likely to happen.
-                // We don't care what the market thinks — if they're wrong, that's our edge.
-                // e.g. market says 3% but we say 63% → huge opportunity, don't skip it.
                 if gbp.prob < self.config.min_probability {
                     continue;
                 }
@@ -690,7 +700,7 @@ impl WeatherStrategy {
         let _ = csv_file.flush();
 
         tracing::info!(
-            "Weather scan: {} edges, {}/{} buckets with prices (WS: {}, Gamma: {}, skipped stale: {}), {} no price, {} forecast API calls, {} cached models",
+            "Weather scan: {} edges, {}/{} buckets with prices (WS: {}, Gamma: {}, skipped stale: {}), {} no price, {} forecast API calls, {} cached models | near-miss: {}",
             total_edges,
             total_scanned - no_price_count,
             total_scanned,
@@ -700,6 +710,7 @@ impl WeatherStrategy {
             no_price_count,
             forecast_calls,
             self.weather.cache_size(),
+            best_near_miss.as_deref().unwrap_or("none above 30%"),
         );
 
         Ok(total_edges)
